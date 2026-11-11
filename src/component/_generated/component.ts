@@ -441,6 +441,38 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
         boolean,
         Name
       >;
+      exportToUploadUrl: FunctionReference<
+        "action",
+        "internal",
+        {
+          contentType?: string;
+          key: string;
+          maxBytes?: number;
+          ownerId: string;
+          path: string;
+          uploadUrl: string;
+          useServerProxy?: boolean;
+        },
+        { path: string; sizeBytes: number; storageId?: string },
+        Name
+      >;
+      importFromUrl: FunctionReference<
+        "action",
+        "internal",
+        {
+          group?: string;
+          key: string;
+          maxBytes?: number;
+          mode?: number;
+          owner?: string;
+          ownerId: string;
+          path: string;
+          url: string;
+          useServerProxy?: boolean;
+        },
+        { path: string; sizeBytes: number },
+        Name
+      >;
       info: FunctionReference<
         "action",
         "internal",
@@ -1442,11 +1474,14 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
           idleMs?: number;
           limit?: number;
           ownerId?: string;
+          pauseIdleMs?: number;
+          protectMetadata?: Record<string, string>;
         },
         {
           checked: number;
           destroyed: Array<{ key: string; ownerId: string; reason: string }>;
           errors: Array<{ key: string; message: string; ownerId: string }>;
+          paused: Array<{ key: string; ownerId: string }>;
           rowsDeleted: number;
           terminated: number;
         },

@@ -16,16 +16,21 @@
   "scripts": {
     "build": "tsc --project ./tsconfig.build.json",
     "build:codegen": "convex codegen --component-dir ./src/component && npm run build",
-    "typecheck": "tsc --noEmit --pretty false",
+    "typecheck": "tsc --noEmit --pretty false && tsc --noEmit -p example/tsconfig.json && tsc --noEmit -p example/convex",
     "test": "vitest run --typecheck",
     "test:watch": "vitest --typecheck",
     "prepare": "npm run build",
-    "e2e": "node scripts/e2e.mjs"
+    "e2e": "node scripts/e2e.mjs",
+    "dev:demo": "vite --config example/vite.config.ts",
+    "build:demo": "vite build --config example/vite.config.ts",
+    "check": "npm run build && npm run typecheck && npm test && npm run build:demo && npm pack --dry-run --silent"
   },
   "files": [
     "dist",
     "src",
-    "!src/**/*.test.ts"
+    "!src/**/*.test.ts",
+    "!src/testing",
+    "!src/setup.ts"
   ],
   "exports": {
     "./package.json": "./package.json",
@@ -54,17 +59,24 @@
     }
   },
   "peerDependencies": {
-    "convex": "^1.43.0",
-    "ai": "^7.0.0"
+    "ai": "^7.0.0",
+    "convex": "^1.43.0"
   },
   "devDependencies": {
     "@edge-runtime/vm": "^5.0.0",
     "@types/node": "^24.10.1",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "@vitejs/plugin-react": "^6.1.1",
     "ai": "^7.0.90",
     "convex": "^1.31.0",
     "convex-test": "^0.0.41",
+    "react": "^19.3.0",
+    "react-dom": "^19.3.0",
     "typescript": "^5.9.3",
-    "vitest": "^3.2.4"
+    "vite": "^8.3.1",
+    "vitest": "^3.2.4",
+    "zod": "^4.5.4"
   },
   "types": "./dist/client/index.d.ts",
   "module": "./dist/client/index.js",
@@ -72,5 +84,10 @@
     "ai": {
       "optional": true
     }
-  }
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/amp127/opensandbox-convex.git"
+  },
+  "homepage": "https://github.com/amp127/opensandbox-convex#readme"
 }

@@ -636,6 +636,7 @@ export const fork = action({
 type SweepResult = {
   checked: number;
   destroyed: Array<{ ownerId: string; key: string; reason: string }>;
+  paused: Array<{ ownerId: string; key: string }>;
   terminated: number;
   rowsDeleted: number;
   errors: Array<{ ownerId: string; key: string; message: string }>;
@@ -644,21 +645,30 @@ type SweepResult = {
 const sweepResult = v.object({
   checked: v.number(),
   destroyed: v.array(v.object({ ownerId: v.string(), key: v.string(), reason: v.string() })),
+  paused: v.array(v.object({ ownerId: v.string(), key: v.string() })),
   terminated: v.number(),
   rowsDeleted: v.number(),
   errors: v.array(v.object({ ownerId: v.string(), key: v.string(), message: v.string() })),
 });
 
 /**
- * Destroy idle sandboxes, mark expired ones Terminated, and delete old
- * Terminated rows. Schedule it from a cron in your app. With no ownerId it
- * walks every owner, oldest update first, up to `limit` rows.
+ * Destroy or pause idle sandboxes, mark expired ones Terminated, and delete
+ * old Terminated rows. Schedule it from a cron in your app. With no ownerId it
+ * walks every owner, oldest update first, up to `limit` rows. Activity is the
+ * last command, code run, or file call through this component.
  */
 export const sweep = action({
   args: {
     ownerId: v.optional(v.string()),
     /** Destroy sandboxes with no activity through this component for this long. */
     idleMs: v.optional(v.number()),
+    /** Pause Running sandboxes idle this long. Paused sandboxes keep memory and files. */
+    pauseIdleMs: v.optional(v.number()),
+    /**
+     * Never destroy sandboxes whose metadata has all of these key/value pairs
+     * (they can still be paused). For example `{ persist: "true" }`.
+     */
+    protectMetadata: v.optional(v.record(v.string(), v.string())),
     /** Delete Terminated and error rows last updated longer ago than this. */
     deleteTerminatedAfterMs: v.optional(v.number()),
     limit: v.optional(v.number()),
@@ -668,6 +678,10 @@ export const sweep = action({
   handler: async (ctx, args): Promise<SweepResult> => {
     const limit = requireInt("limit", args.limit ?? 100, 1, 1000);
     if (args.idleMs !== undefined) requireInt("idleMs", args.idleMs, 60_000, 365 * 86_400_000);
+    if (args.pauseIdleMs !== undefined) requireInt("pauseIdleMs", args.pauseIdleMs, 60_000, 365 * 86_400_000);
+    const protectedPairs = Object.entries(args.protectMetadata ?? {});
+    const isProtected = (row: LoadedSandbox) =>
+      protectedPairs.length > 0 && protectedPairs.every(([name, value]) => row.metadata?.[name] === value);
     if (args.deleteTerminatedAfterMs !== undefined) {
       requireInt("deleteTerminatedAfterMs", args.deleteTerminatedAfterMs, 0, 3650 * 86_400_000);
     }
@@ -681,6 +695,7 @@ export const sweep = action({
     const result: SweepResult = {
       checked: rows.length,
       destroyed: [] as Array<{ ownerId: string; key: string; reason: string }>,
+      paused: [],
       terminated: 0,
       rowsDeleted: 0,
       errors: [] as Array<{ ownerId: string; key: string; message: string }>,
@@ -698,7 +713,7 @@ export const sweep = action({
         const created = Date.parse(row.remoteCreatedAt ?? "");
         const lastActive = row.lastActiveAt ?? (Number.isFinite(created) ? created : row.updatedAt);
         const idleFor = now - lastActive;
-        if (args.idleMs !== undefined && idleFor >= args.idleMs) {
+        if (args.idleMs !== undefined && idleFor >= args.idleMs && !isProtected(row)) {
           if (!args.dryRun) {
             await deleteRemote(conn, row.sandboxId);
             await ctx.runMutation(internal.store.markTerminated, {
@@ -709,6 +724,18 @@ export const sweep = action({
             });
           }
           result.destroyed.push({ ownerId: row.ownerId, key: row.key, reason: "idle" });
+          continue;
+        }
+        if (args.pauseIdleMs !== undefined && idleFor >= args.pauseIdleMs && row.state === "Running") {
+          if (!args.dryRun) {
+            try {
+              await lifecycle(conn, "POST", `/sandboxes/${encodeURIComponent(row.sandboxId)}/pause`);
+            } catch (error) {
+              if (errorData(error)?.code !== "conflict") throw error;
+            }
+            await sync(ctx, conn, row as LoadedSandbox & { sandboxId: string });
+          }
+          result.paused.push({ ownerId: row.ownerId, key: row.key });
           continue;
         }
         const expired = row.expiresAt !== undefined && Date.parse(row.expiresAt) <= now;

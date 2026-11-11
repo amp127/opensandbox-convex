@@ -8,7 +8,12 @@
  * @module
  */
 
+import type * as crons from "../crons.js";
+import type * as demo from "../demo.js";
 import type * as e2e from "../e2e.js";
+import type * as housekeeping from "../housekeeping.js";
+import type * as http from "../http.js";
+import type * as storage from "../storage.js";
 
 import type {
   ApiFromModules,
@@ -17,7 +22,12 @@ import type {
 } from "convex/server";
 
 declare const fullApi: ApiFromModules<{
+  crons: typeof crons;
+  demo: typeof demo;
   e2e: typeof e2e;
+  housekeeping: typeof housekeeping;
+  http: typeof http;
+  storage: typeof storage;
 }>;
 
 /**

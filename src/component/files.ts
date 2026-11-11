@@ -4,11 +4,11 @@ import { v } from "convex/values";
 import { action, type ActionCtx } from "./_generated/server.js";
 import { internal } from "./_generated/api.js";
 import { checkIdentity, connection, execdCall, openExecd, requireRunning, resolvePort } from "./access.js";
-import { osError } from "./errors.js";
+import { osError, scrub } from "./errors.js";
 import { modeToWire, parseFileInfo, type FileInfo } from "./remote.js";
 import { sendBytes, sendJson } from "./transport.js";
 import { identity } from "./validators.js";
-import { MAX_READ_BYTES, MAX_WRITE_BYTES, requireInt } from "./urls.js";
+import { MAX_READ_BYTES, MAX_TRANSFER_BYTES, MAX_WRITE_BYTES, joinUrl, requireInt } from "./urls.js";
 
 const access = { ...identity, useServerProxy: v.optional(v.boolean()) };
 
@@ -332,6 +332,223 @@ export const replace = action({
       const count = (counts as Record<string, { replacedCount?: unknown }> | null)?.[edit.path]?.replacedCount;
       return typeof count === "number" ? { path: edit.path, replacedCount: count } : { path: edit.path };
     });
+  },
+});
+
+// ---------------------------------------------------------------------------
+// URL transfers. The bytes move between Convex and the sandbox inside this
+// action; they never pass through function arguments, so the 8 MiB write cap
+// does not apply. Built for Convex file storage: ctx.storage.getUrl() in, and
+// ctx.storage.generateUploadUrl() out (see the client's copyFromStorage and
+// copyToStorage).
+// ---------------------------------------------------------------------------
+
+function checkTransferUrl(url: string, name: string): void {
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    throw osError("invalid_argument", `${name} is not a URL.`);
+  }
+  if (parsed.protocol !== "https:" && parsed.protocol !== "http:") {
+    throw osError("invalid_argument", `${name} must be http or https.`);
+  }
+  if (parsed.username || parsed.password) throw osError("invalid_argument", `${name} must not contain credentials.`);
+}
+
+function transferCap(maxBytes: number | undefined): number {
+  return requireInt("maxBytes", maxBytes ?? MAX_TRANSFER_BYTES, 1, MAX_TRANSFER_BYTES);
+}
+
+/**
+ * Pass a response body through, counting bytes and failing past `maxBytes`.
+ * Nothing is buffered: memory stays flat whatever the file size.
+ */
+function counted(body: ReadableStream<Uint8Array>, maxBytes: number, prefix?: Uint8Array, suffix?: Uint8Array) {
+  const count = { bytes: 0 };
+  const reader = body.getReader();
+  let started = false;
+  const stream = new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      if (!started) {
+        started = true;
+        if (prefix) {
+          controller.enqueue(prefix);
+          return;
+        }
+      }
+      const { done, value } = await reader.read();
+      if (done) {
+        if (suffix) controller.enqueue(suffix);
+        controller.close();
+        return;
+      }
+      count.bytes += value.byteLength;
+      if (count.bytes > maxBytes) {
+        await reader.cancel().catch(() => undefined);
+        controller.error(osError("too_large", `The file is larger than ${maxBytes} bytes.`));
+        return;
+      }
+      controller.enqueue(value);
+    },
+    async cancel(reason) {
+      await reader.cancel(reason).catch(() => undefined);
+    },
+  });
+  return { stream, count };
+}
+
+async function streamingFetch(url: string, init: RequestInit, timeoutMs: number, secret: string): Promise<Response> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    // duplex is required for a streamed request body; older type libraries do not know it.
+    const response = await fetch(url, { ...init, signal: controller.signal, duplex: "half" } as RequestInit);
+    return response;
+  } catch (error) {
+    const data = (error as { data?: unknown }).data;
+    if (data) throw error;
+    if (error instanceof Error && (error.name === "AbortError" || error.name === "TimeoutError")) {
+      throw osError("timeout", "The transfer did not finish before the deadline.");
+    }
+    throw osError("network", scrub(error instanceof Error ? error.message : "The transfer failed.", secret));
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function failFrom(response: Response, what: string): Promise<never> {
+  const text = await response.text().catch(() => "");
+  let message = `${what} answered HTTP ${response.status}.`;
+  try {
+    const body = JSON.parse(text) as { message?: unknown };
+    if (typeof body.message === "string") message = `${what}: ${body.message}`;
+  } catch {
+    // not JSON
+  }
+  const code = response.status === 404 ? "not_found" : response.status === 413 ? "too_large" : response.status >= 500 ? "unavailable" : "invalid_argument";
+  throw osError(code, scrub(message), { status: response.status });
+}
+
+/**
+ * Download `url` and write it into the sandbox at `path`, streaming: the file
+ * is never held in memory. Only pass URLs your app produced (a storage URL,
+ * say); the component fetches whatever it gets, without the API key.
+ */
+export const importFromUrl = action({
+  args: {
+    ...access,
+    url: v.string(),
+    path: v.string(),
+    mode: v.optional(v.number()),
+    owner: v.optional(v.string()),
+    group: v.optional(v.string()),
+    /** Default and maximum 1 GiB. */
+    maxBytes: v.optional(v.number()),
+  },
+  returns: v.object({ path: v.string(), sizeBytes: v.number() }),
+  handler: async (ctx, args) => {
+    checkPath(args.path);
+    checkTransferUrl(args.url, "url");
+    checkOwnerName(args.owner, "owner");
+    checkOwnerName(args.group, "group");
+    const maxBytes = transferCap(args.maxBytes);
+    const { conn, sandboxId, target } = await openExecd(ctx, args.ownerId, args.key, args.useServerProxy);
+    const source = await streamingFetch(args.url, { method: "GET" }, 600_000, conn.apiKey);
+    if (!source.ok || !source.body) await failFrom(source, "The source URL");
+    const declared = Number(source.headers.get("content-length"));
+    if (Number.isFinite(declared) && declared > maxBytes) {
+      await source.body?.cancel().catch(() => undefined);
+      throw osError("too_large", `The file is ${declared} bytes; the limit is ${maxBytes}.`);
+    }
+
+    const metadata: Record<string, unknown> = { path: args.path };
+    if (args.mode !== undefined) metadata.mode = modeToWire(args.mode);
+    if (args.owner !== undefined) metadata.owner = args.owner;
+    if (args.group !== undefined) metadata.group = args.group;
+    // execd reads both parts as file parts, so both carry a filename.
+    const boundary = `----opensandbox-convex-${crypto.randomUUID()}`;
+    const filename = (args.path.split("/").filter(Boolean).pop() ?? "file").replace(/["\\\r\n]/g, "_");
+    const encoder = new TextEncoder();
+    const head = encoder.encode(
+      `--${boundary}\r\nContent-Disposition: form-data; name="metadata"; filename="metadata"\r\n` +
+        `Content-Type: application/json\r\n\r\n${JSON.stringify(metadata)}\r\n` +
+        `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="${filename}"\r\n` +
+        `Content-Type: application/octet-stream\r\n\r\n`,
+    );
+    const tail = encoder.encode(`\r\n--${boundary}--\r\n`);
+    const { stream, count } = counted(source.body!, maxBytes, head, tail);
+    const upload = await streamingFetch(
+      joinUrl(target.baseUrl, "/files/upload"),
+      {
+        method: "POST",
+        headers: {
+          ...target.headers,
+          ...(target.apiKey ? { "OPEN-SANDBOX-API-KEY": target.apiKey } : {}),
+          "content-type": `multipart/form-data; boundary=${boundary}`,
+        },
+        body: stream,
+      },
+      600_000,
+      conn.apiKey,
+    );
+    if (!upload.ok) await failFrom(upload, "execd");
+    await upload.body?.cancel().catch(() => undefined);
+    await touch(ctx, args.ownerId, args.key, sandboxId);
+    return { path: args.path, sizeBytes: count.bytes };
+  },
+});
+
+/**
+ * Stream `path` from the sandbox to `uploadUrl` (a Convex
+ * ctx.storage.generateUploadUrl() URL). Returns `storageId` when the upload
+ * target is Convex storage.
+ */
+export const exportToUploadUrl = action({
+  args: {
+    ...access,
+    path: v.string(),
+    uploadUrl: v.string(),
+    contentType: v.optional(v.string()),
+    maxBytes: v.optional(v.number()),
+  },
+  returns: v.object({ path: v.string(), sizeBytes: v.number(), storageId: v.optional(v.string()) }),
+  handler: async (ctx, args) => {
+    checkPath(args.path);
+    checkTransferUrl(args.uploadUrl, "uploadUrl");
+    const contentType = args.contentType ?? "application/octet-stream";
+    if (!/^[\w.+-]+\/[\w.+-]+(;[\w\s=.+-]*)?$/.test(contentType)) {
+      throw osError("invalid_argument", "contentType must be a media type such as text/plain.");
+    }
+    const maxBytes = transferCap(args.maxBytes);
+    const { conn, sandboxId, target } = await openExecd(ctx, args.ownerId, args.key, args.useServerProxy);
+    const download = await streamingFetch(
+      joinUrl(target.baseUrl, "/files/download", { path: args.path }),
+      { method: "GET", headers: { ...target.headers, ...(target.apiKey ? { "OPEN-SANDBOX-API-KEY": target.apiKey } : {}) } },
+      600_000,
+      conn.apiKey,
+    );
+    if (!download.ok || !download.body) await failFrom(download, "execd");
+    const { stream, count } = counted(download.body!, maxBytes);
+    const upload = await streamingFetch(
+      args.uploadUrl,
+      { method: "POST", headers: { "content-type": contentType }, body: stream },
+      600_000,
+      conn.apiKey,
+    );
+    if (!upload.ok) await failFrom(upload, "The upload URL");
+    const text = await upload.text();
+    let storageId: string | undefined;
+    try {
+      const parsed = JSON.parse(text) as { storageId?: unknown };
+      if (typeof parsed.storageId === "string") storageId = parsed.storageId;
+    } catch {
+      // Not JSON: an upload target other than Convex storage.
+    }
+    await touch(ctx, args.ownerId, args.key, sandboxId);
+    const result: { path: string; sizeBytes: number; storageId?: string } = { path: args.path, sizeBytes: count.bytes };
+    if (storageId !== undefined) result.storageId = storageId;
+    return result;
   },
 });
 

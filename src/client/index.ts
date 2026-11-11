@@ -372,6 +372,35 @@ export class OpenSandbox {
     });
   }
 
+  /**
+   * Copy a file from your app's Convex file storage into the sandbox. The
+   * bytes stream Convex → sandbox inside a component action (up to 1 GiB);
+   * they never pass through your machine, function arguments, or memory.
+   */
+  async copyFromStorage(
+    ctx: RunActionCtx & { storage: { getUrl(storageId: never): Promise<string | null> } },
+    args: SandboxRef & { storageId: string; path: string; mode?: number; owner?: string; group?: string },
+  ): Promise<{ path: string; sizeBytes: number }> {
+    const { storageId, ...rest } = args;
+    const url = await ctx.storage.getUrl(storageId as never);
+    if (!url) throw new Error(`No file in storage with id ${storageId}.`);
+    return await ctx.runAction(this.component.files.importFromUrl, { ...rest, url, ...this.proxy });
+  }
+
+  /**
+   * Copy a file from the sandbox into your app's Convex file storage and
+   * return its storage id. Streams, up to 1 GiB.
+   */
+  async copyToStorage(
+    ctx: RunActionCtx & { storage: { generateUploadUrl(): Promise<string> } },
+    args: SandboxRef & { path: string; contentType?: string },
+  ): Promise<{ storageId: string; path: string; sizeBytes: number }> {
+    const uploadUrl = await ctx.storage.generateUploadUrl();
+    const result = await ctx.runAction(this.component.files.exportToUploadUrl, { ...args, uploadUrl, ...this.proxy });
+    if (!result.storageId) throw new Error("Convex storage did not return a storage id.");
+    return { ...result, storageId: result.storageId };
+  }
+
   /** Entries under a directory. `depth` 1 (default) lists immediate children. */
   async listFiles(ctx: RunActionCtx, args: SandboxRef & { path: string; depth?: number }): Promise<FileInfo[]> {
     return await ctx.runAction(this.component.files.list, { ...args, ...this.proxy });

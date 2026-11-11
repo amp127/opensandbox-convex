@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { api } from "./_generated/api.js";
 import { errorData } from "./errors.js";
 import { initConvexTest } from "../setup.js";
-import { API_KEY, FakeOpenSandbox } from "../testing/fakeOpenSandbox.js";
+import { API_KEY, FakeOpenSandbox, STORAGE_HOST } from "../testing/fakeOpenSandbox.js";
 
 // A Convex Auth subject: has `|` and is longer than a label value allows.
 const OWNER = "jd7a2kq9x0m3h5tq8w1v2r4c6n9p8s7f|kh2b4n6m8q0r2t4v6x8z0a2c4e6g8i0k";
@@ -151,6 +151,23 @@ describe("lifecycle", () => {
     expect(fake.sandboxes.has("sbx_2")).toBe(true);
   });
 
+  test("sweep pauses idle sandboxes and spares protected ones from destroy", async () => {
+    const t = initConvexTest();
+    await t.action(api.sandboxes.create, { ...ref, image: "x", metadata: { persist: "true" } });
+    await t.action(api.sandboxes.create, { ownerId: OWNER, key: "scratch", image: "x" });
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(Date.now() + 2 * 3_600_000);
+    const result = await t.action(api.sandboxes.sweep, {
+      idleMs: 3_600_000,
+      pauseIdleMs: 600_000,
+      protectMetadata: { persist: "true" },
+    });
+    vi.useRealTimers();
+    expect(result.destroyed).toEqual([{ ownerId: OWNER, key: "scratch", reason: "idle" }]);
+    expect(result.paused).toEqual([{ ownerId: OWNER, key: KEY }]);
+    expect((await t.query(api.sandboxes.get, ref))?.state).toBe("Paused");
+  });
+
   test("sweep destroys idle sandboxes", async () => {
     const { t } = await created();
     vi.useFakeTimers({ toFake: ["Date"] });
@@ -257,6 +274,74 @@ describe("files", () => {
       port: 8000,
       viaServerProxy: false,
     });
+  });
+});
+
+describe("storage transfers", () => {
+  test("a URL streams into the sandbox, and a sandbox file streams to an upload URL", async () => {
+    const { t } = await created();
+    const payload = new Uint8Array(300_000).map((_, i) => (i * 7) % 256);
+    fake.storage.set("src", payload);
+    const imported = await t.action(api.files.importFromUrl, {
+      ...ref,
+      url: `https://${STORAGE_HOST}/files/src`,
+      path: "/data/in.bin",
+      mode: 0o600,
+    });
+    expect(imported).toEqual({ path: "/data/in.bin", sizeBytes: 300_000 });
+    const stored = fake.sandboxes.get("sbx_1")!.files.get("/data/in.bin")!;
+    expect(stored.mode).toBe(600);
+    expect(Buffer.from(stored.data).equals(Buffer.from(payload))).toBe(true);
+
+    const exported = await t.action(api.files.exportToUploadUrl, {
+      ...ref,
+      path: "/data/in.bin",
+      uploadUrl: `https://${STORAGE_HOST}/upload`,
+    });
+    expect(exported).toMatchObject({ path: "/data/in.bin", sizeBytes: 300_000, storageId: "kg2" });
+    expect(Buffer.from(fake.storage.get("kg2")!).equals(Buffer.from(payload))).toBe(true);
+  });
+
+  test("respects maxBytes and reports a missing source", async () => {
+    const { t } = await created();
+    fake.storage.set("big", new Uint8Array(5_000));
+    await expectCode(
+      t.action(api.files.importFromUrl, { ...ref, url: `https://${STORAGE_HOST}/files/big`, path: "/x", maxBytes: 1_000 }),
+      "too_large",
+    );
+    await expectCode(
+      t.action(api.files.importFromUrl, { ...ref, url: `https://${STORAGE_HOST}/files/nope`, path: "/x" }),
+      "not_found",
+    );
+    await expectCode(t.action(api.files.importFromUrl, { ...ref, url: "file:///etc/passwd", path: "/x" }), "invalid_argument");
+  });
+});
+
+describe("races", () => {
+  test("two concurrent creates for one key make one sandbox", async () => {
+    const t = initConvexTest();
+    const [a, b] = await Promise.all([
+      t.action(api.sandboxes.create, { ...ref, image: "x" }),
+      t.action(api.sandboxes.create, { ...ref, image: "x" }),
+    ]);
+    expect(fake.only("POST", "/v1/sandboxes")).toHaveLength(1);
+    expect(a.sandboxId).toBe(b.sandboxId);
+  });
+
+  test("destroy during an in-flight create leaves nothing behind", async () => {
+    const t = initConvexTest();
+    let destroyed: Promise<unknown> | undefined;
+    fake.duringCreate = async () => {
+      fake.duringCreate = undefined;
+      destroyed = t.action(api.sandboxes.destroy, ref);
+      await destroyed;
+    };
+    await expectCode(t.action(api.sandboxes.create, { ...ref, image: "x" }), "conflict");
+    await destroyed;
+    expect(fake.sandboxes.size).toBe(0);
+    expect((await t.query(api.sandboxes.get, ref))?.state).toBe("Terminated");
+    // The key is usable again.
+    expect((await t.action(api.sandboxes.create, { ...ref, image: "x" })).state).toBe("Running");
   });
 });
 

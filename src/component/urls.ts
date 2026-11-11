@@ -29,6 +29,8 @@ export const MAX_OUTPUT_CHARS = 1024 * 1024;
 export const MAX_STREAM_BYTES = 4 * 1024 * 1024;
 export const MAX_WRITE_BYTES = 8 * 1024 * 1024;
 export const MAX_READ_BYTES = 8 * 1024 * 1024;
+/** URL transfers (Convex file storage ↔ sandbox) stream, so this is a sanity cap, not a memory one. */
+export const MAX_TRANSFER_BYTES = 1024 * 1024 * 1024;
 /** Stored on execution rows, only with retainOutput. */
 export const STORED_INPUT_CHARS = 4_096;
 export const STORED_OUTPUT_CHARS = 65_536;

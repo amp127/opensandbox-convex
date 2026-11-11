@@ -7,6 +7,8 @@ Give every user or agent in your Convex app its own [OpenSandbox](https://github
 - **The API key stays on the server.** It is a component environment variable. It is never written to a table, returned, or put in an error. It is sent only to the lifecycle origin, never to a sandbox.
 - **No SDK.** Plain `fetch` in Convex's default runtime. Wire behavior is checked against the upstream server, execd, and SDK sources.
 
+**Guides:** [connecting to a server](docs/connection-guide.md) and [persistent sandboxes](docs/persistent-sandboxes.md) (no expiry, volumes, snapshots, idle pause, self-healing workspaces).
+
 **Connecting to a server:** read [docs/connection-guide.md](docs/connection-guide.md) first. On a public host, execd is unauthenticated, so the guide sets up the server proxy behind TLS.
 
 ## Install
@@ -103,7 +105,7 @@ Every sandbox call names a sandbox by `{ ownerId, key }`.
 | `patchMetadata` | JSON merge patch: a string sets a key, `null` removes it. |
 | `destroy` | Delete it. The row stays as `Terminated`, and the key can be reused. |
 | `fork` | Snapshot `key`, then create `newKey` from the snapshot. |
-| `sweep` | Housekeeping for a cron: destroy sandboxes idle longer than `idleMs`, mark expired ones Terminated, delete old Terminated rows. `dryRun` reports only. |
+| `sweep` | Housekeeping for a cron: pause sandboxes idle longer than `pauseIdleMs`, destroy ones idle longer than `idleMs` (except those matching `protectMetadata`), mark expired ones Terminated, delete old Terminated rows. `dryRun` reports only. |
 | `reconcile` | Refresh every row for an owner, and list (or `destroyOrphans`) sandboxes the component created for that owner that no row links. |
 
 ### Snapshots
@@ -131,6 +133,7 @@ Run status is one of `running`, `succeeded`, `failed`, `timed_out`, `interrupted
 | --- | --- |
 | `readFile`, `readFileBytes` | Up to 8 MiB. Longer files are cut and `truncated` is set. `offset` reads a byte range; `lines: { fromLine, count }` reads lines. |
 | `writeFile`, `writeFiles` | Text or bytes, up to 100 files and 8 MiB per call. Parent directories are created. `mode` is permission bits such as `0o644`; `owner`, `group`. |
+| `copyFromStorage`, `copyToStorage` | Move a file between your app's Convex file storage and the sandbox. The bytes stream Convex ↔ sandbox inside an action (up to 1 GiB, flat memory); nothing passes through the caller. Underlying component functions: `files.importFromUrl`, `files.exportToUploadUrl`. |
 | `listFiles` | Directory entries, `depth` 1 to 32. |
 | `fileInfo`, `exists`, `searchFiles` | Metadata, existence, glob search. |
 | `deleteFile(s)` | Files, or directories with `recursive: true`. |
@@ -173,7 +176,12 @@ crons.interval("sandbox sweep", { minutes: 15 }, internal.sandboxes.sweep);
 export const sweep = internalAction({
   args: {},
   handler: async (ctx) => {
-    await sandboxes.sweep(ctx, { idleMs: 60 * 60_000, deleteTerminatedAfterMs: 7 * 86_400_000 });
+    await sandboxes.sweep(ctx, {
+      pauseIdleMs: 30 * 60_000,
+      idleMs: 4 * 60 * 60_000,
+      protectMetadata: { persist: "true" },
+      deleteTerminatedAfterMs: 7 * 86_400_000,
+    });
     await sandboxes.purgeExecutions(ctx, { olderThanMs: 30 * 86_400_000 });
   },
 });
@@ -214,6 +222,40 @@ Errors are `ConvexError`s. `openSandboxErrorData(error)` returns `{ kind: "OpenS
 ## Not covered
 
 PTY sessions are not covered: they need a WebSocket, which a request-response action cannot hold. Isolated execution sessions and fsb template management are not covered either: they are server-admin features, not per-tenant ones. Use the OpenSandbox API for those.
+
+## Console
+
+`node scripts/console.mjs <sandboxId>` opens an interactive shell in a sandbox over execd's PTY WebSocket, through the server proxy. It reads `OPENSANDBOX_DOMAIN` and `OPENSANDBOX_API_KEY` from the environment or from the Convex deployment.
+
+## Demo
+
+`example/` is a working app: create sandboxes from three images, then use a terminal, a file browser and editor, the code interpreter, a live preview (served from inside the sandbox through `convex/http.ts`, which holds the API key), and a live run history. It also has the housekeeping cron (`convex/crons.ts`) and storage transfers (`convex/storage.ts`).
+
+```sh
+npx convex dev                    # in one terminal; set OPENSANDBOX_API_KEY and OPENSANDBOX_DOMAIN first
+npm run build && npm run dev:demo # in another; opens the page
+```
+
+The demo identifies visitors by a random id kept in the browser, not by sign-in, so treat a deployed copy as public.
+
+## What is tested
+
+| Area | Unit tests (fake server) | Live, against a real server |
+| --- | --- | --- |
+| Lifecycle, idempotent create, adoption, concurrent create, destroy-during-create | ✔ | create, pause, resume, renew, destroy |
+| Commands, sessions, spawn, logs, kill, timeouts, execd 1.1 quirks | ✔ | ✔ |
+| Code interpreter | ✔ | ✔ |
+| Files, permissions, ranges, search, replace | ✔ | ✔ |
+| Storage transfers | ✔ | ✔ up to 500 MB |
+| Snapshots, fork, restore with volumes | ✔ | ✔ |
+| Network policy | — | ✔ (DNS mode) |
+| Preview relay, server proxy | ✔ | ✔ |
+| `sweep`, `reconcile` | ✔ | reconcile |
+| AI SDK tools | ✔ (stubbed sandbox) | — |
+| Credential vault, renew-on-access, signed endpoints | — | — (need server features the reference server lacks) |
+| Kubernetes runtime, multi-tenant servers | — | — |
+
+`npm run check` runs everything except the live suite, as CI does. The live suite is `npm run e2e` (see the connection guide).
 
 ## Develop
 

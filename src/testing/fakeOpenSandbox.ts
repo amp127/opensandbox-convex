@@ -16,7 +16,10 @@ export interface Call {
   url: URL;
   headers: Record<string, string>;
   body: unknown;
+  init?: RequestInit;
 }
+
+export const STORAGE_HOST = "storage.example.com";
 
 interface FakeSandbox {
   id: string;
@@ -50,6 +53,10 @@ export class FakeOpenSandbox {
   /** Snapshot reads before it turns Ready. */
   snapshotReadsUntilReady = 1;
   endpointHost = "ingress.example.com";
+  /** Files served at https://storage.example.com/files/<name>, and uploads received at /upload. */
+  storage = new Map<string, Uint8Array>();
+  /** Called while POST /sandboxes is in flight, after the sandbox exists. */
+  duringCreate?: () => Promise<void>;
   /** Behave like execd 1.1.x: no argv, one event per line without the line ending. */
   legacyExecd = false;
   endpointHeaders: Record<string, string> = { "OpenSandbox-Ingress-To": "secret-route" };
@@ -71,7 +78,7 @@ export class FakeOpenSandbox {
             // keep raw
           }
         }
-        const call = { method: init?.method ?? "GET", url: new URL(raw), headers, body };
+        const call = { method: init?.method ?? "GET", url: new URL(raw), headers, body, init };
         this.calls.push(call);
         if (init?.signal?.aborted) throw new DOMException("aborted", "AbortError");
         return await this.handle(call);
@@ -113,6 +120,20 @@ export class FakeOpenSandbox {
       }
       return await this.lifecycle(call, path.replace(/^\/v1/, ""));
     }
+    if (call.url.host === STORAGE_HOST) {
+      if (call.headers["open-sandbox-api-key"]) throw new Error("The API key leaked to a storage URL.");
+      if (call.method === "GET" && path.startsWith("/files/")) {
+        const file = this.storage.get(path.slice(7));
+        return file ? new Response(file as Uint8Array<ArrayBuffer>, { status: 200 }) : new Response("missing", { status: 404 });
+      }
+      if (call.method === "POST" && path === "/upload") {
+        const bytes = new Uint8Array(await new Response(call.init?.body as BodyInit).arrayBuffer());
+        const id = `kg${this.storage.size + 1}`;
+        this.storage.set(id, bytes);
+        return this.json({ storageId: id });
+      }
+      return new Response("no route", { status: 404 });
+    }
     if (call.url.host === this.endpointHost) {
       for (const [name, value] of Object.entries(this.endpointHeaders)) {
         if (call.headers[name.toLowerCase()] !== value) return this.json({ error: "missing route header" }, 401);
@@ -151,6 +172,7 @@ export class FakeOpenSandbox {
         files: new Map(),
       };
       this.sandboxes.set(id, sandbox);
+      if (this.duringCreate) await this.duringCreate();
       if (this.loseNextCreateResponse) {
         this.loseNextCreateResponse = false;
         throw new TypeError("fetch failed: socket hang up");
@@ -286,7 +308,16 @@ export class FakeOpenSandbox {
       });
     }
     if (call.method === "POST" && path === "/files/upload") {
-      const form = call.body as FormData;
+      // FormData from files.write, or a streamed multipart body from importFromUrl.
+      const form =
+        call.body instanceof FormData
+          ? call.body
+          : await new Request("https://execd.local/upload", {
+              method: "POST",
+              body: call.init?.body as BodyInit,
+              headers: { "content-type": call.headers["content-type"] ?? "" },
+              duplex: "half",
+            } as RequestInit).formData();
       const metas = form.getAll("metadata");
       const files = form.getAll("file");
       for (let index = 0; index < metas.length; index += 1) {
