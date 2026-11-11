@@ -1,0 +1,76 @@
+{
+  "name": "opensandbox-convex",
+  "description": "OpenSandbox for Convex: isolated sandboxes for AI agents (commands, code, files, snapshots, egress control), with live state in your tables.",
+  "version": "0.2.0",
+  "license": "MIT",
+  "keywords": [
+    "convex",
+    "convex-component",
+    "component",
+    "opensandbox",
+    "opensandbox-convex",
+    "sandbox",
+    "ai-agents"
+  ],
+  "type": "module",
+  "scripts": {
+    "build": "tsc --project ./tsconfig.build.json",
+    "build:codegen": "convex codegen --component-dir ./src/component && npm run build",
+    "typecheck": "tsc --noEmit --pretty false",
+    "test": "vitest run --typecheck",
+    "test:watch": "vitest --typecheck",
+    "prepare": "npm run build",
+    "e2e": "node scripts/e2e.mjs"
+  },
+  "files": [
+    "dist",
+    "src",
+    "!src/**/*.test.ts"
+  ],
+  "exports": {
+    "./package.json": "./package.json",
+    ".": {
+      "types": "./dist/client/index.d.ts",
+      "default": "./dist/client/index.js"
+    },
+    "./ai": {
+      "types": "./dist/client/ai.d.ts",
+      "default": "./dist/client/ai.js"
+    },
+    "./test": "./src/test.ts",
+    "./_generated/component.js": {
+      "types": "./dist/component/_generated/component.d.ts"
+    },
+    "./_generated/component": {
+      "types": "./dist/component/_generated/component.d.ts"
+    },
+    "./convex.config.js": {
+      "types": "./dist/component/convex.config.d.ts",
+      "default": "./dist/component/convex.config.js"
+    },
+    "./convex.config": {
+      "types": "./dist/component/convex.config.d.ts",
+      "default": "./dist/component/convex.config.js"
+    }
+  },
+  "peerDependencies": {
+    "convex": "^1.43.0",
+    "ai": "^7.0.0"
+  },
+  "devDependencies": {
+    "@edge-runtime/vm": "^5.0.0",
+    "@types/node": "^24.10.1",
+    "ai": "^7.0.90",
+    "convex": "^1.31.0",
+    "convex-test": "^0.0.41",
+    "typescript": "^5.9.3",
+    "vitest": "^3.2.4"
+  },
+  "types": "./dist/client/index.d.ts",
+  "module": "./dist/client/index.js",
+  "peerDependenciesMeta": {
+    "ai": {
+      "optional": true
+    }
+  }
+}
